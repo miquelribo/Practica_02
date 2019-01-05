@@ -1,0 +1,1354 @@
+---
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r}
+library(tidyverse)
+library(gridExtra)
+library(stats)
+library(class)
+library(randomForest)
+library(C50)
+
+# Carrerguem el fitxer de dades al pickle df, mantenint el tipus int
+# per a les dades subjectives de quality
+df <- read_csv(".\\winequality-red.csv",
+               col_names = TRUE,
+               col_types = "dddddddddddi")
+
+# Substituim els espais als noms de columna per "_"
+names(df) <- gsub(" ", "_", names(df))
+
+df %>% select(1:4)  %>% summary() %>% print()
+df %>% select(5:8)  %>% summary() %>% print()
+df %>% select(9:12) %>% summary() %>% print()
+
+```
+
+
+```{r}
+# Transformem les dades numèriques enteres de qualitat, "quality"", en
+# tres tipus de factors, un amb els mateixos valors numèrics considerats
+# com a factors, un altre que divideix la qualitat del vi en "Bona",
+# "Regular" i "Dolenta", i un altre en "Adequada" i "No adequada". Generem
+# també versions numèriques enteres de tots els factors. 
+
+levels1 = as.character(0L:10L) # No emprat
+levels2 = as.character(3L:8L)
+levels3 = c("Dolenta","Regular", "Bona")
+levels4 = c("No adequada", "Adequada")
+
+aux1n <- df$quality-2L
+aux1c <- df$quality %>% as.character() %>%
+         factor(.,levels = levels2, ordered = TRUE)
+
+aux2n <- ifelse(df$quality <= 4L, 1L, ifelse(df$quality >= 7L, 3L, 2L))
+aux2c <- ifelse(df$quality <= 4L, "Dolenta", ifelse(df$quality >= 7L, "Bona", "Regular")) %>%
+         factor(.,levels = levels3, ordered = TRUE)
+
+aux3n <- ifelse(df$quality <= 6L, 1L, 2L)
+aux3c <- ifelse(df$quality <= 6L, "No adequada", "Adequada") %>% 
+         factor(.,levels = levels4, ordered = TRUE)
+
+# Incorporem aquestes noves variables categòriques al tibble df
+# per al seu ús posterior
+df <- df %>% mutate(quality_n1 = aux1n,
+                    quality_c1 = aux1c, 
+                    quality_n2 = aux2n,
+                    quality_c2 = aux2c,
+                    quality_n3 = aux3n,
+                    quality_c3 = aux3c)
+
+# Imprimim els còmputs de valors
+cat("quality_c1")
+print(table(df$quality_c1))
+cat("\nquality_c2")
+print(table(df$quality_c2))
+cat("\nquality_c3")
+print(table(df$quality_c3))
+```
+
+
+```{r}
+# Comprovem si el dataset té valors NA
+aux1 <- df %>% select(-(quality:quality_c3)) %>%
+               lapply(function(x) { length(which(is.na(x))) }) %>%
+               as_tibble() 
+
+# Comprovem si el dataset té zeros
+aux2 <- df %>% select(-(quality:quality_c3)) %>%
+        lapply(function(x) { length(which(x<1e-6)) }) %>%
+        as_tibble()
+
+# Combinem els resultats per a imprimir-los
+# Passem a data.frame per a afegir noms de fila
+aux <- bind_rows(aux1, aux2) %>% as.data.frame()
+row.names(aux) <- c("NA", "Zeros")
+aux %>% t() %>% print()
+
+```
+
+
+```{r}
+
+# Predicció, emprant regressions lineals dels valors d'àcid cítric 
+# per a les mostres amb un valor idènticament igual a 0.
+
+# Primerament generem una columna addcional, després de la de
+# 'citric_acid', anomenada 'citric_acid_corr',  que contindrà
+# els valors corregits de 'citric_acid'
+df <- df %>% mutate(citric_acid_corr = citric_acid) %>%
+  select(fixed_acidity:citric_acid, citric_acid_corr, everything())
+
+# Generem un conjunt d'entrenament del model lineal amb les dades
+# que tenen 'citric_acid' != 0, i un per a emprar en la predicció,
+# per a les dades que tenen 'citric_acid' != 0. 
+# Emprem la funció filter de dplyr, que diferenciem de la de la 
+# llibreria base, per a augmentar la claredat
+df_predict <- df %>% dplyr::filter(citric_acid < 1e-6) 
+df_train   <- df %>% dplyr::filter(citric_acid >= 1e-6)
+
+# Generem una fórmula per a la regressió lineal de 'citric_acid'
+# a partir d'una cadena de caràcters construïda a patir dels noms de les
+# la resta de columnes del tibble df (llevat de les de quality, quality_c1
+# i quality_c2 i citric_acid_corr)
+f <- df %>% select(-citric_acid, -citric_acid_corr, -(quality:quality_c3)) %>% 
+  names() %>% paste(collapse = "+") %>% paste("citric_acid ~",.) %>%
+  as.formula()
+                  
+# Calculem els coeficients del model de regressió lineal emprant
+# les dades d'entrenament, df_train, en què coneixem el valor exacte
+# del paràmetre 'citric_acid'
+model <- lm(f, data = df_train)
+
+# Imprimim i dibuixem les dades rellevants de la fase d'entrenament
+cat("Coeficients :\n")
+print(model$coefficients)
+cat("\nError absolut rms per mostra :\n",
+    sqrt(sum(model$residuals**2)/nrow(df_train)), "\n")
+cat("\nCorrelació entre predicció i valors d'entrenament :\n",
+     cor(df_train$citric_acid, model$fitted.values), "\n")
+
+ggplot() +
+  geom_point(mapping = aes(x = df_train$citric_acid, y = model$fitted.values)) +
+  xlab("citric_acid (real)") +
+  ylab("citric_acid (predit)") +
+  labs(title = "Valors reals vs. predits (dades d'entrenament)",
+       substitle = NULL,
+       tag = NULL)
+
+```
+
+
+```{r}
+# Fem la predicció (correcció) dels valors de citric_acid per a les mostres
+# amb citric_acid = 0, col·lapsant les prediccions menors que zero a zero
+p <- predict(model, df_predict)
+p0 <- ifelse(p>0, p, 0)
+
+# Incorporem aquests nous valors al paràmetre 'citric_acid_corr' NOMÉS per
+# a les dades que tenen 'citric_acid' == 0
+df_predict <- df_predict %>% mutate(citric_acid_corr = p0)
+
+# Recomposem el tibble original, df, tot i que amb un altre ordre de
+# columnes, apilant les dades de df_train i # df_predict
+df <- bind_rows(df_train, df_predict)
+
+# Comparem les distribuicions estadístiques de 'citric_acid' i
+# 'citric_acid_corr'
+gg1 <- ggplot(data = df) +
+  geom_histogram(mapping = aes(citric_acid, fill = quality_c2), bins = 20)
+  
+gg2 <- ggplot(data = df) +
+  geom_histogram(mapping = aes(citric_acid_corr, fill = quality_c2), bins = 20)
+
+grid.arrange(gg1, gg2, ncol = 2)
+
+# Dibuixem l'histograma de només els valors corregits de citric_acid
+ggplot(data = df_predict) +
+  geom_histogram(mapping = aes(citric_acid_corr, fill = quality_c2), bins = 20)
+
+```
+
+
+```{r}
+# Historgrames de les 12 variables numèriques del data set
+
+aux <- df %>% select(-citric_acid)
+
+for (i in 0:5) {
+  aux1 <- ggplot(data = aux) +
+    geom_histogram(mapping = aes(aux[[names(aux)[2*i+1]]],
+                                 fill = quality_c2), bins = 20) +
+    xlab(names(aux)[2*i+1])
+  
+  aux2 <- ggplot(data = aux) +
+    geom_histogram(mapping = aes(aux[[names(aux)[2*i+2]]],
+                                 fill = quality_c2), bins = 20) +
+    xlab(names(aux)[2*i+2])
+  
+  grid.arrange(aux1, aux2, ncol = 2)
+}
+
+```
+
+
+```{r}
+# Fem un còmput de valors per columna que estan a més
+# de 3*sigma de la mitjana.
+cat("Nombre de valors fora de (m-3s, m+3s) per paràmetre: \n")
+df %>% select(-(quality:quality_c3)) %>%
+  lapply(function(x) { length(which(abs(x-mean(x))>3*sd(x))) }) %>%
+  as_tibble() %>% t() %>% print() 
+
+```
+
+
+```{r}
+# Anàlisi de vins segons acidesa i sucre residual
+
+# Quantitat de vins dins la categoria "Sec"
+df %>% filter((residual_sugar < 4) |
+              ((residual_sugar < 9) & 
+               (residual_sugar-(fixed_acidity+volatile_acidity) < 2))) %>%
+       count() %>% unlist() %>%
+       cat("Quantitat de vins secs :", .)
+
+# Quantitat de vins dins de la categoria "residual_sugar < 4"
+df %>% filter(residual_sugar < 4) %>%
+       count() %>% unlist() %>%
+       cat("\nQuantitat de vins amb residual_sugar < 4 :", .)
+
+# Quantitat de vins dins la categoria "Sec" amb "residual_sugar > 4"
+df %>% filter((residual_sugar >= 4), 
+              ((residual_sugar < 9) & 
+               (residual_sugar-(fixed_acidity+volatile_acidity) < 2))) %>%
+       count() %>% unlist() %>%
+       cat("\nQuantitat de vins secs amb residual_sugar > 4 :", .)
+
+# Vins fora de la categoria "Sec"
+df %>% filter(residual_sugar >= 4,
+              (residual_sugar >= 9) | 
+              (residual_sugar-(fixed_acidity+volatile_acidity)> 2)) %>%
+       count() %>% unlist() %>%
+       cat("\nQuantitat de vins no secs :", .)
+
+# Interval (m-3s, m+3s) per a "residual_sugar"
+cat("\n\nInterval (m-3s, m+3s) per a residual_sugar : (",
+    mean(df$residual_sugar)-3*sd(df$residual_sugar), ",",
+    mean(df$residual_sugar)+3*sd(df$residual_sugar),")")
+# Nombre de vins amb "residual_sugar > m+3s"
+df %>% dplyr::filter(residual_sugar >
+                     mean(residual_sugar)+3*sd(residual_sugar)) %>%
+       count() %>% unlist() %>%
+       cat("\nQuantitat de vins amb residual_sugar > m+3s :", .)
+
+# Interval (m-3s, m+3s) per a "fixed_acidity"
+cat("\nInterval (m-3s, m+3s) per a fixed_acidity : (",
+    mean(df$fixed_acidity)-3*sd(df$fixed_acidity), ",",
+    mean(df$fixed_acidity)+3*sd(df$fixed_acidity),")")
+# Nombre de vins amb "fixed_acidity > m+3s"
+df %>% dplyr::filter(fixed_acidity >
+                     mean(fixed_acidity)+3*sd(fixed_acidity)) %>%
+       count() %>% unlist() %>%
+       cat("\nQuantitat de vins amb fixed_acidity > m+3s :", .)
+
+```
+
+
+```{r}
+# Nivells il·legals de sulfits
+df %>% filter(total_sulfur_dioxide > 160) %>%
+       select(total_sulfur_dioxide, free_sulfur_dioxide, quality) %>%
+       t() %>% print()
+```
+
+
+```{r}
+# Normalitzem les dades del data set (llevat de les de qualitat del vi)
+# per tal que tinguin mitja 0 i variança 1
+dfn <- df %>% select(-(quality:quality_c3)) %>%
+  lapply(function(x) {(x-mean(x))/sd(x)}) %>% as_tibble()
+dfn <- dfn %>% mutate(quality    = df$quality,
+                      quality_n1 = df$quality_n1,
+                      quality_c1 = df$quality_c1,
+                      quality_n2 = df$quality_n2,
+                      quality_c2 = df$quality_c2,
+                      quality_n3 = df$quality_n3,
+                      quality_c3 = df$quality_c3)
+```
+
+
+```{r}
+# Desem els data sets pre-processats
+write_csv(df, "df.csv", col_names = TRUE)
+write_csv(dfn, "dfn.csv", col_names = TRUE)
+
+```
+
+
+```{r}
+# Dividim les dades en dos conjunts estratificats segons alguna
+# de les variables categòriques quality_c1, quality_c2 o quality_c3
+
+stratified_train_test_split <- function(estratificador,
+                                        prop_dades_entrenament = 0.8,
+                                        random_seed = 42) {
+  # Funció que genera diversos vectors amb els ordinals o la posició
+  # de les files per a una divisió estratificada d'un tibble/dataframe
+  # de dades (representada per l'array de dades categòriques 'estratificador'
+  # a partir de la qual generar la tria estratificada de files) en un
+  # conjunt de files d'entrenament i un altre de test
+
+  n_files = length(estratificador)
+  
+  set.seed(random_seed)
+  
+  # Emprem el paradigma SPLIT-APPLY-COMBINE
+  
+  # SPLIT: Separem els ordinals de fila del dataframe original en
+  # una llista segons el valor de la variable categòrica
+  # de la nostra elecció
+  ldf <- split(1:n_files, estratificador)
+  
+  # APPLY: Per a  cada element de la llista (array d'ordinals que correspon
+  # a un valor de la variable categòrica d'interès), generem un array
+  # amb els ordinals de les files que corresponen a les mostres 
+  # entrenament, triades en un percentatge fix donat per
+  # 'prop_dades_entrenament', fet que garanteix un mostreig
+  # estratificat
+  mostres <- lapply(ldf, function(x) {
+    sample(x,as.integer(length(x)*prop_dades_entrenament),
+           replace = FALSE)
+  })
+  
+  # COMBINE: Combinem (concatenem amb la funció c()) els vectors obtinguts
+  # amb la funció do.call(). Obtenin un vector amb els ordinals de les files
+  # d'entrenament
+  rows_train <- do.call(c, mostres)
+  
+  # Vector lògic que indica si una fila pertany al conjunt. d'entrenament:
+  #   is_train[i] = TRUE si la fila i hi pertany; sinó, FALSE
+  is_train <- is.element(1:n_files, rows_train)
+  
+  # Les files que no són d'entrenament són de test
+  is_test <- !is_train
+  rows_test <- which(is_test)
+  
+  list(rows_train = rows_train,
+       is_train = is_train,
+       rows_test = rows_test,
+       is_test = is_test)
+}
+
+# Comprovem que funciona correctament...
+aux <- stratified_train_test_split(df$quality_c3, 0.8)
+
+cat("\nProp. de registres amb qualitat 'No adequada' al c. d'entrenament : \n", 
+    nrow(filter(df, aux$is_train, quality_c3 == 'No adequada')) /
+    nrow(filter(df, quality_c3 == 'No adequada')))
+cat("\nProp. de registres amb qualitat 'Adequada' al c. d'entrenament : \n",
+    nrow(filter(df, aux$is_train, quality_c3 == 'Adequada')) /
+    nrow(filter(df, quality_c3 == 'Adequada')))
+cat("\nProp. de registres amb qualitat 'No adequada' al c. de test : \n",
+    nrow(filter(df, aux$is_test, quality_c3 == 'No adequada')) /
+    nrow(filter(df, quality_c3 == 'No adequada')))
+cat("\nProp. de registres amb qualitat 'Adequada' al c. de test : : \n",
+    nrow(filter(df, aux$is_test, quality_c3 == 'Adequada')) /
+    nrow(filter(df, quality_c3 == 'Adequada')))
+
+```
+
+
+```{r}
+# Mesures de normalitat de les dades mitjançant el test
+# de Shapiro-Wilk
+alpha <- 0.05
+
+swt <- df %>% select(-(quality_n1:quality_c3)) %>%
+              lapply(shapiro.test)
+
+# Imprimim els resultats...
+tibble(parametre = names(swt),
+       p_value = lapply(swt,
+                   function(x) x$p.value) %>% unlist(),
+       distribucio_normal = (lapply(swt,
+                               function(x) x$p.value) %>% unlist()) > alpha) %>%
+  t() %>% t() %>% print()
+
+```
+
+```{r}
+# Q-Q plots per a avaluar visualment la normalitat de les dades
+
+df_aux <- df
+
+for (i in 0:5) {
+  aux1 <- ggplot(data = df_aux, aes(sample = df_aux[[names(df_aux)[2*i+1]]])) +
+    stat_qq(color = "blue") +
+    stat_qq_line() +
+    labs(title = names(df_aux)[2*i+1])
+
+  aux2 <- ggplot(data = df_aux, aes(sample = df_aux[[names(df_aux)[2*i+2]]])) +
+    stat_qq(color = "blue") +
+    stat_qq_line() +
+    labs(title = names(df_aux)[2*i+2])
+
+  grid.arrange(aux1, aux2, ncol = 2)
+}
+
+```
+
+
+```{r}
+# Test de Fligner-Killeen d'homogeneïtat de les variàncies
+
+alpha <- 0.05
+
+df_aux <- df
+categ <- df_aux$quality_c3
+
+# Apliquem el test a les variables físico-químiques
+fkt <- df_aux %>% select(-(quality:quality_c3)) %>%
+                  lapply(function(x) { fligner.test(split(x,categ)) })
+  
+# Imprimim els resultats...
+tibble(parametre = names(fkt),
+       p_value = lapply(fkt,
+                        function(x) x$p.value) %>% unlist(),
+       variancies_iguals = (lapply(fkt,
+                        function(x) x$p.value) %>% unlist()) > alpha) %>%
+  t() %>% t() %>% print()
+
+```
+
+```{r}
+# Test de Welch sobre la igualtat de mitjanes entre mostres
+
+# Nivell de significança del test
+alpha <- 0.05
+
+df_aux <- df
+noms <- df_aux %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names()
+wtt = list()
+
+for (nom in noms) {
+    wtt[[nom]] <- t.test(df_aux %>% dplyr::filter(quality_c3 == "Adequada") %>%
+                               select(nom) %>%
+                               unlist(),
+                         df_aux %>% dplyr::filter(quality_c3 == "No adequada") %>%
+                               select(nom) %>%
+                               unlist(),
+                         alternative = "two.sided",
+                         mu = 0,
+                         var.equal = FALSE)$p.value
+}
+
+# Imprimim els resultats
+tibble(parametre = names(wtt),
+       p_value = unlist(wtt),
+       mitjanes_iguals = unlist(wtt) >= alpha ) %>%
+       t() %>% t() %>% print()
+
+```
+
+```{r}
+# Test de Kruskal-Wallis de provinença de la mateixa distribució.
+# Testeja si hi ha algun grup que en domina estocàsticament un altre
+
+alpha <- 0.05
+
+df_aux <- df
+categ <- df_aux$quality_c2
+
+# Apliquem el test a les variables físico-químiques
+kwt <- df_aux %>% select(-(quality:quality_c3)) %>%
+                  lapply(function(x) { kruskal.test(split(x,categ)) })
+
+# Imprimim els resultats...
+tibble(parametre = names(kwt),
+       p_value = lapply(kwt,
+                        function(x) x$p.value) %>% unlist(),
+       grups_iguals = (lapply(kwt,
+                        function(x) x$p.value) %>% unlist()) > alpha) %>%
+  t() %>% t() %>% print()
+
+```
+
+```{r}
+# aux <- df %>% select(-(quality:quality_c3)) %>%
+#               lapply(function(x)
+#                     pairwise.wilcox.test(x,
+#                                          df$quality_c2)$p.value) %>%
+#               lapply(function(x) c(x[1,1],x[2,1],x[2,2])) %>%
+#               data.frame()
+# rownames(aux) <- c("Regular-Dolenta", "Bona-Dolenta", "Bona-Regular")
+# 
+# print(aux)
+
+```
+
+```{r}
+# Calculem les correlacions entre columnes
+aux <- df %>% select(-citric_acid, -(quality_n1:quality_c3)) %>% cor()
+
+aux[,1:3] %>% print()
+aux[,4:6] %>% print()
+aux[,7:9] %>% print()
+aux[,10:12] %>% print()
+```
+
+```{r}
+# Funció robusta que arrodoneix a un enter
+arrodoneix_a_enter <- function(x) {
+    aux <- as.integer(x)
+    ifelse(abs(x-aux) < 0.5 , aux, ifelse(x < 0, aux-1L, aux+1L))
+}
+
+# Funció que retorna les prediccions numèriques i categòriques
+# d'una regressió lineal
+pred_reg_lineal <- function (df_aux_train,
+                             df_aux_test,
+                             variables,
+                             objectiu_num,
+                             objectiu_cat) {
+    
+    # Generem una fórmula per a la regressió lineal
+    # a partir d'una cadena de caràcters construïda a patir
+    # dels noms de les variables
+    f_aux <- variables %>% paste(collapse = "+") %>%
+             paste(objectiu_num, "~", .) %>%
+             as.formula()
+      
+    # Generem un model de regressió lineal
+    model_aux <- lm(f_aux, data = df_aux_train)
+    
+    # Fem la predicció dels valors de objectiu_num per a les mostres
+    # de test
+    objectiu_num_pred <- predict(model_aux, df_aux_test)
+      
+    # Transformem la predicció del model lineal en una
+    # predicció categòrica/classificació (col·lapsem valors 
+    # massa petits o grans als valors extrems)
+    aux <- arrodoneix_a_enter(objectiu_num_pred)
+    objectiu_cat_pred <- ifelse(aux < min(df_aux_test[[objectiu_num]]),
+                                min(df_aux_test[[objectiu_num]]),
+                                ifelse(aux > max(df_aux_test[[objectiu_num]]),
+                                       max(df_aux_test[[objectiu_num]]),
+                                       aux)) %>%
+                         sapply(function(x) levels(df_aux_test[[objectiu_cat]])[x]) %>%
+                         as.character()  %>%
+                         factor(levels = levels(df_aux_test[[objectiu_cat]]),
+                                ordered = TRUE)
+    
+    # Retornem els valors rellevants
+    return(list(model = model_aux,
+                pred_num = objectiu_num_pred,
+                pred_cat = objectiu_cat_pred))
+}
+
+# Funció que calcula l'score d'una classificació categòrica
+precisio <- function(pred, real) {
+    return(length(which(real == pred)) / length(real))
+}
+
+# Funció que calcula la precisió per tipus de mostra mitja
+precisio_tmm <- function(pred, real) {
+    return(tibble(valor = real,
+                  pred = pred) %>%
+           split(real) %>%
+           lapply(function(x) {length(which(x$valor == x$pred)) /
+                               length(x$valor) }) %>%
+           do.call(c, .) %>%
+           mean())
+}
+
+# Funció que imprimeix resultats d'una classificació categòrica
+impr_resultats_class <- function(pred, real) {
+    
+    # Imprimim els valors de classificació obtinguts
+    cat("Precisió : \n", precisio(pred, real))
+      
+    cat("\nPrecisió per tipus de mostra mitja :\n", precisio_tmm(pred, real))
+        
+    cat("\nTaula de contingència :\n")
+    print(table(real, pred))
+
+}
+
+# Predicció de qualitat a partir d'una regressió lineal
+reg_lineal <- function (dframe,
+                        variables,
+                        objectiu_num,
+                        objectiu_cat,
+                        prop_entrenament = 0.8,
+                        random_state = 42) {
+
+    # Generem un comjunt de test i un d'entrenament
+    itts <- stratified_train_test_split(dframe[[objectiu_cat]],
+                                        prop_entrenament,
+                                        random_state)
+      
+    df_aux_train <- dframe %>% dplyr::filter(itts$is_train)
+    df_aux_test <- dframe %>% dplyr::filter(itts$is_test)
+     
+    # Calculem les prediccions de regressió lineal
+    prl <- pred_reg_lineal(df_aux_train,
+                           df_aux_test,
+                           variables,
+                           objectiu_num,
+                           objectiu_cat)
+    
+    
+    # Imprimim les dades rellevants de la fase d'entrenament
+    cat("\nFASE D'ENTRENAMENT\n")
+    cat("Coeficients : \n")
+    print(prl$model$coefficients)
+    cat("Error absolut rms per mostra : \n",
+        sqrt(sum(prl$model$residuals**2)/nrow(df_aux_train)))
+    cat("\nCorrelació entre predicció i valors d'entrenament : \n",
+        cor(df_aux_train[[objectiu_num]], prl$model$fitted.values))
+    
+    # Imprimim les dades rellevants de la fase de test
+    cat("\n\nFASE DE TEST\n")
+    cat("Error absolut rms per mostra : \n",
+        sqrt(sum((prl$pred_num - df_aux_test[[objectiu_num]])**2) /
+                 nrow(df_aux_test)))
+    cat("\nCorrelació entre predicció i valors de test : \n",
+        cor(prl$pred_num, df_aux_test[[objectiu_num]]))
+    
+    # Imprimim els valors de classificació obtinguts
+    cat("\n\nCLASSIFICACIÓ DE LES MOSTRES DE TEST\n")
+    impr_resultats_class(prl$pred_cat, df_aux_test[[objectiu_cat]])
+    
+}
+
+cat("REGRESSIÓ LINEAL PER A quality_c1\n")
+cat("---------------------------------\n")
+reg_lineal(dfn,
+           dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_n1",
+           "quality_c1")
+
+
+cat("\nREGRESSIÓ LINEAL PER A quality_c2\n")
+cat("---------------------------------\n")
+reg_lineal(dfn,
+           dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_n2",
+           "quality_c2")
+
+cat("\nREGRESSIÓ LINEAL PER A quality_c3\n")
+cat("---------------------------------\n")
+reg_lineal(dfn,
+           dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_n3",
+           "quality_c3")
+
+```
+
+```{r}
+
+# Disminució de la numerositat per a mostres del data set amb qualitat 5 o 6
+df_aux <- dfn
+
+set.seed(42)
+
+# Generem un vector de nombres de fila amb la numerositat
+# reduïda
+
+# SPLIT
+aux <- split(1:nrow(df_aux), df_aux$quality_c1)
+# APPLY
+aux[['5']]<- sample(aux[['5']], 110, replace = FALSE)
+aux[['6']]<- sample(aux[['6']], 110, replace = FALSE)
+# COMBINE
+m_reduides <- do.call(c, aux) 
+es_reduida <- is.element(1:nrow(df_aux), m_reduides)
+
+# Generem un nou dada set amb la numerositat reduïda
+# per a les qualitats "Regular" (5 i 6) 
+dfn_red <- df_aux %>% dplyr::filter(es_reduida)
+
+# Imprimim la nova distribució de qualitats
+dfn_red %>% select(quality_c1) %>% table() %>% print()
+
+```
+
+```{r}
+cat("REGRESSIÓ LINEAL PER A quality_c1\n")
+cat("---------------------------------\n")
+reg_lineal(dfn_red,
+           dfn_red %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_n1",
+           "quality_c1")
+
+cat("\nREGRESSIÓ LINEAL PER A quality_c2\n")
+cat("---------------------------------\n")
+reg_lineal(dfn_red,
+           dfn_red %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_n2",
+           "quality_c2")# Predicció de qualitat a partir d'una regressió lineal
+
+cat("\nREGRESSIÓ LINEAL PER A quality_c3\n")
+cat("---------------------------------\n")
+reg_lineal(dfn_red,
+           dfn_red %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_n3",
+           "quality_c3")
+
+```
+
+```{r}
+
+# Funció que equilibra la numerositat d'un data set
+equilibra_numerositat <- function(df_aux_train,
+                                  objectiu_cat,
+                                  prop_min_files = 0.25,
+                                  prop_sd_soroll = 0.33) {
+
+    # Calculem el nombre mínim de registres/files que trindrà cada 
+    # classe com a proporció del nombre de registres que té la
+    # classe més nombrosa
+    aux <- table(df_aux_train[[objectiu_cat]]) %>% as.vector()
+        min_files <- as.integer(prop_min_files*max(aux))
+    
+    # SPLIT
+    aux1 <- df_aux_train %>% split(df_aux_train[[objectiu_cat]])
+    
+    # APPLY
+    aux2 <- aux1 %>% lapply(function(dfaux) {
+        if(nrow(dfaux)>min_files) {
+            # Si la classe té prou files, la retornem
+            # sense modificar
+            return(dfaux)
+        }
+        
+        # Generem dues "parts"" del data frame amb les files addicionals
+        # reptetint les existents
+        filaux <- rep(1:nrow(dfaux),
+                      length.out = min_files - nrow(dfaux))
+        
+        dfaux2 <- dfaux[filaux,] %>% select(-(quality:quality_c3))
+        dfaux3 <- dfaux[filaux,] %>% select(quality:quality_c3)
+        
+        # A cada columna de paràmetres fisico-químics afegim
+        # soroll a les files afegides
+        dfaux2 <- dfaux2 %>% lapply(function(colaux) {
+            
+            if(length(colaux)<5) {
+                # Si hi ha pocs elements (sd(colaux) pot ser estranya)
+                # els retornem sense modificar
+                return(colaux)
+            } else {
+                # Sinó, hi afegim soroll gaussià de sd = sd(colaux)*prop_sd_soroll
+                return (colaux + rnorm(length(colaux),
+                                       0, sd(colaux)*prop_sd_soroll))
+            }
+
+        }) %>% as_tibble()
+       
+        # Unim les columnes amb dades numèriques amb les columnes amb dades
+        # categòriques i qualitatives del data frame amb les dades sintètiques
+        # per a la classe que estem modificant
+        dfaux4 <- bind_cols(dfaux2, dfaux3)
+        
+        # Afegim les files sintètiques a les originals de la classe i retornem
+        # el valor
+        return(bind_rows(dfaux, dfaux4))
+
+    })
+    
+    # COMBINE
+    aux3 <- do.call(bind_rows, aux2)
+
+    # Retornem el data frame amb la numerositat augmentada
+    return(aux3)
+}
+
+# Predicció de qualitat a partir d'una regressió lineal
+reg_lineal_bis <- function (dframe,
+                            variables,
+                            objectiu_num,
+                            objectiu_cat,
+                            prop_entrenament = 0.8,
+                            random_state = 42,
+                            prop_min_files = 0.25,
+                            prop_sd_soroll = 0.33) {
+
+    # Generem un comjunt de test i un d'entrenament
+    itts <- stratified_train_test_split(dframe[[objectiu_cat]],
+                                        prop_entrenament,
+                                        random_state)
+      
+    df_aux_train <- dframe %>% dplyr::filter(itts$is_train)
+    df_aux_test <- dframe %>% dplyr::filter(itts$is_test)
+    
+    # Equilibrem la numerositat de les dades d'entrenament
+    df_aux_train <- equilibra_numerositat(df_aux_train,
+                                          objectiu_cat,
+                                          prop_min_files = prop_min_files,
+                                          prop_sd_soroll = prop_sd_soroll)
+    
+    # Calculem les prediccions de regressió lineal
+    prl <- pred_reg_lineal(df_aux_train,
+                           df_aux_test,
+                           variables,
+                           objectiu_num,
+                           objectiu_cat)
+    
+    # Imprimim les dades rellevants de la fase d'entrenament
+    cat("\n\nFASE D'ENTRENAMENT\n")
+    cat("Coeficients : \n")
+    print(prl$model$coefficients)
+    cat("Error absolut rms per mostra : \n",
+        sqrt(sum(prl$model$residuals**2)/nrow(df_aux_train)))
+    cat("\nCorrelació entre predicció i valors d'entrenament : \n",
+        cor(df_aux_train[[objectiu_num]], prl$model$fitted.values))
+    
+    # Imprimim les dades rellevants de la fase de test
+    cat("\n\nFASE DE TEST\n")
+    cat("Error absolut rms per mostra : \n",
+        sqrt(sum((prl$pred_num - df_aux_test[[objectiu_num]])**2) /
+                 nrow(df_aux_test)))
+    cat("\nCorrelació entre predicció i valors de test : \n",
+        cor(prl$pred_num, df_aux_test[[objectiu_num]]))
+    
+    # Imprimim els valors de classificació obtinguts
+    cat("\n\nCLASSIFICACIÓ DE LES MOSTRES DE TEST\n")
+    impr_resultats_class(prl$pred_cat, df_aux_test[[objectiu_cat]])
+    
+}
+
+cat("REGRESSIÓ LINEAL PER A quality_c1\n")
+cat("---------------------------------\n")
+reg_lineal_bis(dfn,
+           dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_n1",
+           "quality_c1",
+           prop_min_files = 0.25,
+           prop_sd_soroll = 0.33)
+
+cat("\nREGRESSIÓ LINEAL PER A quality_c2\n")
+cat("---------------------------------\n")
+reg_lineal_bis(dfn,
+           dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_n2",
+           "quality_c2",
+           prop_min_files = 0.25,
+           prop_sd_soroll = 0.33)
+
+cat("\nREGRESSIÓ LINEAL PER A quality_c3\n")
+cat("---------------------------------\n")
+reg_lineal_bis(dfn,
+           dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_n3",
+           "quality_c3",
+           prop_min_files = 0.25,
+           prop_sd_soroll = 0.33)
+
+```
+
+```{r}
+
+# Divisió dels nombres de fila d'un data frame en k folds estratificats 
+# en funció de la variable objectiu_cat
+stratified_k_folds <- function(k, dframe, objectiu_cat) {
+    
+    # Dividim els nombres de fila en funció d'objectiu_cat
+    aux1 <- 1:nrow(dframe) %>% split(dframe[[objectiu_cat]])
+    
+    # Assignem un nombre de fold a cada element de cada divisió anterior
+    aux2 <- aux1 %>% lapply(function(x) { cut(1:length(x), k,
+                                              labels = FALSE, 
+                                              include.lowest = TRUE,
+                                              right = TRUE) })
+
+    # Reconstruim la sortida desitjada, seleccionant els elements de cada fold
+    # de la llista aux1
+    sortida <- list()
+
+    for(i in 1:k) {
+        acum <- c()
+        for(n in names(aux1)) {
+            acum <- c(acum, aux1[[n]][aux2[[n]] == i])
+        }
+            
+    sortida[[i]] <- acum     
+        
+    }
+    
+return(sortida)
+
+}
+
+# Comprovem que funciona...
+# 
+# aux <- stratified_k_folds(10, dfn, "quality_c1")
+# 
+# for(i in 1:10) {
+#     table(dfn[l[[i]],"quality_c1"]) %>% print()
+# }
+
+```
+
+
+```{r}
+reg_lineal_sel_param <- function(dframe,
+                                 variables,
+                                 objectiu_num,
+                                 objectiu_cat,
+                                 prop_entrenament = 0.8,
+                                 k = 5,
+                                 random_state = 42) {
+
+    # Generem un comjunt de test i un d'entrenament
+    itts <- stratified_train_test_split(dframe[[objectiu_cat]],
+                                        prop_entrenament,
+                                        random_state)
+      
+    df_aux_train <- dframe %>% dplyr::filter(itts$is_train)
+    df_aux_test <- dframe %>% dplyr::filter(itts$is_test)
+    
+    
+    # Calculem les precisons de referència per a les dades
+    # segons un esquema de validació creuada amb les dades
+    # d'entrenament
+    folds <- stratified_k_folds(k, df_aux_train, objectiu_cat)
+    
+    # Acumuladors per a les precisions
+    p_0 <- c()
+    p_tmm0 <- c()
+    for(i in 1:k) {
+        
+        # Seleccionen el fold de test i prenen els altres com d'entrenament
+        trn <- df_aux_train %>% 
+               dplyr::filter(!is.element(1:nrow(df_aux_train), folds[[i]])) 
+        tst <- df_aux_train %>%
+               dplyr::filter(is.element(1:nrow(df_aux_train), folds[[i]]))
+        
+        # Calculem els paràemtres de la regressió lineal i acumulem les precisions
+        rlin <- pred_reg_lineal(trn,
+                                tst,
+                                variables,
+                                objectiu_num,
+                                objectiu_cat)
+        p_0 <- c(p_0, precisio(rlin$pred_cat, tst[[objectiu_cat]]))
+        p_tmm0 <- c(p_tmm0, precisio_tmm(rlin$pred_cat, tst[[objectiu_cat]]))
+    }
+    
+    # Calculem els valors mitjos
+    p_0 <- mean(p_0)
+    p_tmm0 <- mean(p_tmm0)
+    
+    # Emprant els mateixos folds, implementem un esquema de selecció de
+    # variables. Eliminem una variable cada vegada, i ens quedem amb el 
+    # resultat millor
+    p_max <- p_0
+    p_t_mmmax <- p_tmm0
+    variables_max <- variables
+    
+    millorat <- TRUE
+    
+    while ((length(variables) >= 2) && millorat) {
+        
+        millorat <- FALSE
+        
+        for(v in variables) {
+            
+            variables_0 <- variables[!(variables == v)]
+            p_0 <- c()
+            p_tmm0 <- c()
+            
+            for(i in 1:k) {
+                
+                # Seleccionen el fold de test i prenen els altres com d'entrenament
+                trn <- df_aux_train %>%
+                       dplyr::filter(!is.element(1:nrow(df_aux_train), folds[[i]])) 
+                tst <- df_aux_train %>%
+                       dplyr::filter(is.element(1:nrow(df_aux_train), folds[[i]]))
+                
+                # Calculem els paràemtres de la regressió lineal i acumulem les precisions
+                rlin <- pred_reg_lineal(trn,
+                                        tst,
+                                        variables_0,
+                                        objectiu_num,
+                                        objectiu_cat)
+                p_0 <- c(p_0, precisio(rlin$pred_cat, tst[[objectiu_cat]]))
+                p_tmm0 <- c(p_tmm0, precisio_tmm(rlin$pred_cat, tst[[objectiu_cat]]))
+            }
+            
+            # Calculem els valors mitjos
+            p_0 <- mean(p_0)
+            p_tmm0 <- mean(p_tmm0)
+            
+            if(p_0 > p_max) {
+                p_max <- p_0
+                p_t_mmmax <- p_tmm0
+                variables_max <- variables_0
+                millorat <- TRUE
+            }
+        }
+    variables <- variables_max
+    }
+
+    # Una vegada tenim el conjunt de variables òptim, implementem la regressió
+    # lineal amb totes les dades d'entrenament i de test
+
+    cat("El conjunt òptim de variables és : \n")
+    print(variables_max)
+    cat("La precisió mitja aconseguida és : ", p_max,"\n")
+    
+    # Calculem les prediccions de regressió lineal
+    prl <- pred_reg_lineal(df_aux_train,
+                           df_aux_test,
+                           variables_max,
+                           objectiu_num,
+                           objectiu_cat)
+    
+    
+    # Imprimim les dades rellevants de la fase d'entrenament
+    cat("\nFASE D'ENTRENAMENT\n")
+    cat("Coeficients : \n")
+    print(prl$model$coefficients)
+    cat("Error absolut rms per mostra : \n",
+        sqrt(sum(prl$model$residuals**2)/nrow(df_aux_train)))
+    cat("\nCorrelació entre predicció i valors d'entrenament : \n",
+        cor(df_aux_train[[objectiu_num]], prl$model$fitted.values))
+    
+    # Imprimim les dades rellevants de la fase de test
+    cat("\n\nFASE DE TEST\n")
+    cat("Error absolut rms per mostra : \n",
+        sqrt(sum((prl$pred_num - df_aux_test[[objectiu_num]])**2) /
+                 nrow(df_aux_test)))
+    cat("\nCorrelació entre predicció i valors de test : \n",
+        cor(prl$pred_num, df_aux_test[[objectiu_num]]))
+    
+    # Imprimim els valors de classificació obtinguts
+    cat("\n\nCLASSIFICACIÓ DE LES MOSTRES DE TEST\n")
+    impr_resultats_class(prl$pred_cat, df_aux_test[[objectiu_cat]])
+
+}
+
+cat("REGRESSIÓ LINEAL PER A quality_c1\n")
+cat("---------------------------------\n")
+reg_lineal_sel_param(dfn,
+                     dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                             names(),
+                     "quality_n1",
+                     "quality_c1",
+                     prop_entrenament = 0.8,
+                     k = 5,
+                     random_state = 42)
+
+cat("\nREGRESSIÓ LINEAL PER A quality_c2\n")
+cat("---------------------------------\n")
+reg_lineal_sel_param(dfn,
+                     dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                             names(),
+                     "quality_n2",
+                     "quality_c2",
+                     prop_entrenament = 0.8,
+                     k = 5,
+                     random_state = 42)
+
+cat("\nREGRESSIÓ LINEAL PER A quality_c3\n")
+cat("---------------------------------\n")
+reg_lineal_sel_param(dfn,
+                     dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                             names(),
+                     "quality_n3",
+                     "quality_c3",
+                     prop_entrenament = 0.8,
+                     k = 5,
+                     random_state = 42)
+
+```
+
+```{r}
+cat("REGRESSIÓ LINEAL PER A quality_c1\n")
+cat("---------------------------------\n")
+reg_lineal_sel_param(dfn_red,
+                     dfn_red %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                             names(),
+                     "quality_n1",
+                     "quality_c1",
+                     prop_entrenament = 0.8,
+                     k = 5,
+                     random_state = 42)
+
+cat("\nREGRESSIÓ LINEAL PER A quality_c2\n")
+cat("---------------------------------\n")
+reg_lineal_sel_param(dfn_red,
+                     dfn_red %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                             names(),
+                     "quality_n2",
+                     "quality_c2",
+                     prop_entrenament = 0.8,
+                     k = 5,
+                     random_state = 42)
+
+cat("\nREGRESSIÓ LINEAL PER A quality_c3\n")
+cat("---------------------------------\n")
+reg_lineal_sel_param(dfn_red,
+                     dfn_red %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                             names(),
+                     "quality_n3",
+                     "quality_c3",
+                     prop_entrenament = 0.8,
+                     k = 5,
+                     random_state = 42)
+
+```
+
+
+
+```{r}
+
+# Predicció de qualitat a partir d'un classificador kNN
+
+class_kNN <- function (dframe,
+                       variables,
+                       objectiu_cat,
+                       k = 20,
+                       prop_entrenament = 0.8,
+                       random_state = 42) {
+
+    # Generem un comjunt de test i un d'entrenament
+    itts <- stratified_train_test_split(dframe[[objectiu_cat]],
+                                        prop_entrenament,
+                                        random_state)
+  
+    df_aux_train <- dframe %>% dplyr::filter(itts$is_train)
+    df_aux_test  <- dframe %>% dplyr::filter(itts$is_test)
+
+    # Predicció
+    quality_pred_knn <- knn(df_aux_train %>% select(variables),
+                               df_aux_test %>% select(variables),
+                               df_aux_train[[objectiu_cat]],
+                               k = k) %>%
+                               as.character() %>%
+                               factor(levels = levels(df_aux_test[[objectiu_cat]]),
+                                                      ordered = TRUE) 
+
+    # Imprimim els valors de classificació obtinguts
+    impr_resultats_class(quality_pred_knn, df_aux_test[[objectiu_cat]])
+
+}
+
+cat("CLASSIFICACIÓ KNN PER A quality_c1\n")
+cat("----------------------------------\n")
+class_kNN(dfn,
+          dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                  names(),
+          "quality_c1",
+          k = 20,
+          prop_entrenament = 0.8,
+          random_state = 42)
+
+cat("\nCLASSIFICACIÓ KNN PER A quality_c2\n")
+cat("----------------------------------\n")
+class_kNN(dfn,
+          dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                  names(),
+          "quality_c2",
+          k = 20,
+          prop_entrenament = 0.8,
+          random_state = 42)
+
+cat("\nCLASSIFICACIÓ KNN PER A quality_c2\n")
+cat("----------------------------------\n")
+class_kNN(dfn,
+          dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                  names(),
+          "quality_c3",
+          k = 20,
+          prop_entrenament = 0.8,
+          random_state = 42)
+
+```
+
+```{r}
+# Predicció de qualitat a partir d'un classificador Random Forest
+
+class_RF <- function (dframe,
+                      variables,
+                      objectiu_cat,
+                      prop_entrenament = 0.8,
+                      random_state = 42) {
+
+    # Generem un comjunt de test i un d'entrenament
+    itts <- stratified_train_test_split(dframe[[objectiu_cat]],
+                                        prop_entrenament,
+                                        random_state)
+
+    df_aux_train <- dframe %>% dplyr::filter(itts$is_train)
+    df_aux_test  <- dframe %>% dplyr::filter(itts$is_test)
+
+    # Generem un classificador Random Forest
+    set.seed(random_state)
+    rfc <- df_aux_train %>%
+           select(variables) %>%
+           randomForest(df_aux_train[[objectiu_cat]],
+                        n_tree = 100,
+                        replace = TRUE)
+
+    # Generem la predicció amb el conjunt de test
+    objectiu_cat_pred <- df_aux_test %>%
+                         select(variables) %>%
+                         predict(rfc, .) %>%
+                         as.character() %>%
+                         factor(levels = levels(df_aux_test[[objectiu_cat]]),
+                                ordered = TRUE)
+
+    # Imprimim els valors de classificació obtinguts
+    impr_resultats_class(objectiu_cat_pred, df_aux_test[[objectiu_cat]])
+
+}
+
+cat("CLASSIFICACIÓ RANDOM FOREST PER A quality_c1\n")
+cat("--------------------------------------------\n")
+class_RF(dfn,
+         dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                 names(),
+         "quality_c1")
+
+cat("\nCLASSIFICACIÓ RANDOM FOREST PER A quality_c2\n")
+cat("--------------------------------------------\n")
+class_RF(dfn,
+         dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                 names(),
+         "quality_c2")
+
+cat("\nCLASSIFICACIÓ RANDOM FOREST PER A quality_c3\n")
+cat("--------------------------------------------\n")
+class_RF(dfn,
+         dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                 names(),
+         "quality_c3")
+
+```
+
+```{r}
+cat("CLASSIFICACIÓ RANDOM FOREST PER A quality_c1\n")
+cat("--------------------------------------------\n")
+class_RF(dfn_red,
+         dfn_red %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                 names(),
+         "quality_c1")
+
+cat("\nCLASSIFICACIÓ RANDOM FOREST PER A quality_c2\n")
+cat("--------------------------------------------\n")
+class_RF(dfn_red,
+         dfn_red %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                 names(),
+         "quality_c2")
+
+cat("\nCLASSIFICACIÓ RANDOM FOREST PER A quality_c3\n")
+cat("--------------------------------------------\n")
+class_RF(dfn_red,
+         dfn_red %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                 names(),
+         "quality_c3")
+```
+
+
+```{r}
+# Predicció de qualitat a partir d'un classificador C5.0
+
+class_C5.0 <- function(dframe,
+                       variables,
+                       objectiu_cat,
+                       prop_entrenament = 0.8,
+                       random_state = 42) {
+
+    # Generem un comjunt de test i un d'entrenament
+    itts <- stratified_train_test_split(dframe[[objectiu_cat]],
+                                        prop_entrenament,
+                                        random_state)
+
+    df_aux_train <- dframe %>% dplyr::filter(itts$is_train)
+    df_aux_test  <- dframe %>% dplyr::filter(itts$is_test)
+
+    # Generem un classificador C5.0
+    set.seed(random_state)
+    c5.0c <- df_aux_train %>%
+             select(variables) %>%
+             C5.0(df_aux_train[[objectiu_cat]],
+             trials = 10,
+             rules = FALSE)
+
+    # Generem la predicció amb el conjunt de test
+    objectiu_cat_pred <- df_aux_test %>%
+                         select(variables) %>%
+                         predict(c5.0c, .) %>%
+                         as.character() %>%
+                         factor(levels = levels(df_aux_test[[objectiu_cat]]),
+                                ordered = TRUE)
+
+    # Imprimim els valors de classificació obtinguts
+    impr_resultats_class(objectiu_cat_pred, df_aux_test[[objectiu_cat]])
+
+}
+
+cat("CLASSIFICACIÓ C5.0 PER A quality_c1\n")
+cat("-----------------------------------\n")
+class_C5.0(dfn,
+           dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                  names(),
+           "quality_c1")
+
+cat("\nCLASSIFICACIÓ C5.0 PER A quality_c2\n")
+cat("-----------------------------------\n")
+class_C5.0(dfn,
+           dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_c2")
+
+cat("\nCLASSIFICACIÓ C5.0 PER A quality_c3\n")
+cat("-----------------------------------\n")
+
+class_C5.0(dfn,
+           dfn %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_c3")
+
+```
+
+
+```{r}
+cat("\nCLASSIFICACIÓ SEGONS quality_c1\n")
+class_C5.0(dfn_red,
+           dfn_red %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                  names(),
+           "quality_c1")
+
+cat("\n\nCLASSIFICACIÓ SEGONS quality_c2\n")
+class_C5.0(dfn_red,
+           dfn_red %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_c2")
+
+cat("\n\nCLASSIFICACIÓ SEGONS quality_c3\n")
+class_C5.0(dfn_red,
+           dfn_red %>% select(-citric_acid, -(quality:quality_c3)) %>%
+                   names(),
+           "quality_c3")
+
+```
+
+
+```
+
